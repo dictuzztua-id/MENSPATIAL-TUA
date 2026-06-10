@@ -2,22 +2,23 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from fuzzywuzzy import fuzz, process
+import requests
 from geopy.distance import geodesic
 import folium
 from streamlit_folium import st_folium
-from folium.plugins import MarkerCluster
+from folium.plugins import MarkerCluster, HeatMap
+import re
 import io
 from datetime import datetime
 import plotly.express as px
-import warnings
-warnings.filterwarnings('ignore')
+import plotly.graph_objects as go
 
 # Page configuration
 st.set_page_config(
     page_title="Outlet Detail Checker",
     page_icon="🏪",
     layout="wide",
-    initial_sidebar_state="collapsed"
+    initial_sidebar_state="expanded"
 )
 
 # Custom CSS for elegant UI
@@ -49,680 +50,699 @@ st.markdown("""
         color: white;
         text-align: center;
     }
-    div[data-testid="stMetricValue"] {
-        font-size: 24px;
+    .stDataFrame {
+        font-size: 0.9rem;
     }
 </style>
 """, unsafe_allow_html=True)
 
-# Initialize session state
-if 'outlet_loaded' not in st.session_state:
-    st.session_state.outlet_loaded = False
-if 'rute_loaded' not in st.session_state:
-    st.session_state.rute_loaded = False
-if 'quadran_loaded' not in st.session_state:
-    st.session_state.quadran_loaded = False
-if 'outlet_index' not in st.session_state:
-    st.session_state.outlet_index = None
-if 'df_outlet_cache' not in st.session_state:
-    st.session_state.df_outlet_cache = None
-if 'df_rute_cache' not in st.session_state:
-    st.session_state.df_rute_cache = None
-if 'df_quadran_cache' not in st.session_state:
-    st.session_state.df_quadran_cache = None
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def load_outlet_data():
-    """Load outlet data with minimal columns needed"""
+@st.cache_data
+def load_data():
+    """Load all data files"""
     try:
-        df = pd.read_excel('MASTER OUTLET AQUA.xlsx')
+        df_outlet = pd.read_excel('MASTER OUTLET AQUA.xlsx')
+        df_rute = pd.read_excel('RUTE ALL.xlsx')
+        df_quadran = pd.read_excel('Quadran.xlsx')
         
         # Standardize column names
-        df.columns = df.columns.str.strip()
+        df_outlet.columns = df_outlet.columns.str.strip()
+        df_rute.columns = df_rute.columns.str.strip()
+        df_quadran.columns = df_quadran.columns.str.strip()
         
-        # Keep only essential columns to reduce memory
-        essential_cols = ['ID_PELANGGAN', 'NAMA_PELANGGAN', 'ALAMAT', 'KONTAK', 
-                        'TELEPON', 'STATUS_PELANGGAN', 'SEGMENTASI', 'DEPO',
-                        'Latitude', 'Longitude',
-                        'KELURAHAN', 'KECAMATAN', 'KAB_KOT', 'PROVINSI']
+        # Preprocess for analytics
+        df_outlet_clean = df_outlet.copy()
+        df_outlet_clean['Latitude'] = pd.to_numeric(df_outlet_clean['Latitude'], errors='coerce')
+        df_outlet_clean['Longitude'] = pd.to_numeric(df_outlet_clean['Longitude'], errors='coerce')
+        if 'KREDIT_LIMIT' in df_outlet_clean.columns:
+            df_outlet_clean['KREDIT_LIMIT'] = pd.to_numeric(df_outlet_clean['KREDIT_LIMIT'], errors='coerce').fillna(0)
         
-        available_cols = [c for c in essential_cols if c in df.columns]
-        df = df[available_cols].copy()
-        
-        # Clean coordinates once
-        df['Latitude'] = pd.to_numeric(df['Latitude'], errors='coerce')
-        df['Longitude'] = pd.to_numeric(df['Longitude'], errors='coerce')
-        
-        # Create search index
-        df['SEARCH_KEY'] = (df['ID_PELANGGAN'].astype(str) + ' ' + 
-                           df['NAMA_PELANGGAN'].astype(str)).str.upper()
-        
-        return df
+        return df_outlet, df_rute, df_quadran, df_outlet_clean
     except Exception as e:
-        st.error(f"Error loading outlet data: {e}")
-        return None
+        st.error(f"Error loading data: {e}")
+        return None, None, None, None
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def load_rute_data():
-    """Load route data"""
+def clean_coordinates(lat, lon):
+    """Clean and validate coordinates"""
     try:
-        df = pd.read_excel('RUTE ALL.xlsx')
-        df.columns = df.columns.str.strip()
-        return df
-    except Exception as e:
-        st.error(f"Error loading route data: {e}")
-        return None
+        if pd.isna(lat) or pd.isna(lon):
+            return None, None
+        lat = float(lat)
+        lon = float(lon)
+        if -90 <= lat <= 90 and -180 <= lon <= 180:
+            return lat, lon
+        return None, None
+    except:
+        return None, None
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def load_quadran_data():
-    """Load quadran data"""
-    try:
-        df = pd.read_excel('Quadran.xlsx')
-        df.columns = df.columns.str.strip()
-        
-        # Create lookup key
-        if 'KELURAHAN' in df.columns and 'KECAMATAN' in df.columns:
-            df['LOOKUP_KEY'] = (df['KELURAHAN'].astype(str).str.upper() + '|' + 
-                               df['KECAMATAN'].astype(str).str.upper())
-        
-        return df
-    except Exception as e:
-        st.error(f"Error loading quadran data: {e}")
-        return None
-
-def get_outlet_data():
-    """Get outlet data from cache or load"""
-    if st.session_state.df_outlet_cache is None:
-        st.session_state.df_outlet_cache = load_outlet_data()
-    return st.session_state.df_outlet_cache
-
-def get_rute_data():
-    """Get route data from cache or load"""
-    if st.session_state.df_rute_cache is None:
-        st.session_state.df_rute_cache = load_rute_data()
-    return st.session_state.df_rute_cache
-
-def get_quadran_data():
-    """Get quadran data from cache or load"""
-    if st.session_state.df_quadran_cache is None:
-        st.session_state.df_quadran_cache = load_quadran_data()
-    return st.session_state.df_quadran_cache
-
-def search_outlet(query, df_outlet, search_type='contains'):
-    """Search for outlet by ID or name"""
-    if not query or df_outlet is None:
+def search_outlet(query, df_outlet, search_type='exact'):
+    """Search for outlet by ID or name with different search types"""
+    if not query:
         return pd.DataFrame()
     
     query = str(query).strip().upper()
     
     if search_type == 'exact':
-        mask = df_outlet['SEARCH_KEY'] == query
+        # Exact match on ID or Name
+        mask = (df_outlet['ID_PELANGGAN'].astype(str).str.upper() == query) | \
+               (df_outlet['NAMA_PELANGGAN'].astype(str).str.upper() == query)
         return df_outlet[mask]
     
     elif search_type == 'contains':
-        mask = df_outlet['SEARCH_KEY'].str.contains(query, na=False)
+        # Partial match
+        mask = (df_outlet['ID_PELANGGAN'].astype(str).str.upper().str.contains(query, na=False)) | \
+               (df_outlet['NAMA_PELANGGAN'].astype(str).str.upper().str.contains(query, na=False))
         return df_outlet[mask]
     
     elif search_type == 'fuzzy':
-        # Limit to first 5000 rows for performance
-        sample_df = df_outlet.head(5000)
-        search_keys = sample_df['SEARCH_KEY'].tolist()
+        # Fuzzy matching using fuzzywuzzy
+        outlet_names = df_outlet['NAMA_PELANGGAN'].astype(str).tolist()
+        outlet_ids = df_outlet['ID_PELANGGAN'].astype(str).tolist()
         
-        matches = process.extract(query, search_keys, limit=20, scorer=fuzz.partial_ratio)
+        # Search in names
+        name_matches = process.extract(query, outlet_names, limit=10, scorer=fuzz.partial_ratio)
+        # Search in IDs
+        id_matches = process.extract(query, outlet_ids, limit=10, scorer=fuzz.partial_ratio)
         
-        matched_indices = []
-        for match, score in matches:
+        # Get indices of matches with score >= 70
+        matched_indices = set()
+        for match, score in name_matches + id_matches:
             if score >= 70:
-                idx = sample_df[sample_df['SEARCH_KEY'] == match].index
-                matched_indices.extend(idx.tolist())
+                indices = df_outlet[
+                    (df_outlet['NAMA_PELANGGAN'].astype(str) == match) | 
+                    (df_outlet['ID_PELANGGAN'].astype(str) == match)
+                ].index.tolist()
+                matched_indices.update(indices)
         
         if matched_indices:
-            return df_outlet.loc[matched_indices].drop_duplicates()
+            return df_outlet.loc[list(matched_indices)]
         return pd.DataFrame()
     
     return pd.DataFrame()
 
 def get_route_info(outlet_id, df_rute):
     """Get route information for an outlet"""
-    if df_rute is None or outlet_id is None:
-        return pd.DataFrame()
-    
-    # Try different column names
-    id_col = None
-    for col in ['ID PELANGGAN', 'ID_PELANGGAN', 'CUSTOMER_ID']:
-        if col in df_rute.columns:
-            id_col = col
-            break
-    
-    if id_col:
-        routes = df_rute[df_rute[id_col] == outlet_id]
-        return routes
-    return pd.DataFrame()
+    routes = df_rute[df_rute['ID PELANGGAN'] == outlet_id]
+    return routes
 
-def determine_quadran(kelurahan, kecamatan, df_quadran):
+def determine_quadran(lat, lon, kelurahan, kecamatan, kab_kot, province, df_quadran):
     """Determine quadran based on location"""
-    if df_quadran is None or pd.isna(kelurahan) or pd.isna(kecamatan):
+    if pd.isna(kelurahan) or pd.isna(kecamatan) or pd.isna(kab_kot) or pd.isna(province):
         return "Tidak Diketahui"
     
-    kelurahan = str(kelurahan).strip().upper()
-    kecamatan = str(kecamatan).strip().upper()
-    
-    # Try exact match
-    lookup_key = f"{kelurahan}|{kecamatan}"
-    if 'LOOKUP_KEY' in df_quadran.columns:
-        mask = df_quadran['LOOKUP_KEY'] == lookup_key
-        matches = df_quadran[mask]
-        if len(matches) > 0:
-            return matches.iloc[0]['QUADRAN']
-    
-    # Try partial match
-    mask = (df_quadran['KELURAHAN'].astype(str).str.upper().str.contains(kelurahan, na=False)) & \
-           (df_quadran['KECAMATAN'].astype(str).str.upper().str.contains(kecamatan, na=False))
+    # Try exact match first
+    mask = (df_quadran['KELURAHAN'].astype(str).str.upper() == str(kelurahan).upper()) & \
+           (df_quadran['KECAMATAN'].astype(str).str.upper() == str(kecamatan).upper()) & \
+           (df_quadran['KAB_KOT'].astype(str).str.upper() == str(kab_kot).upper()) & \
+           (df_quadran['PROVINCE'].astype(str).str.upper() == str(province).upper())
     
     matches = df_quadran[mask]
+    
     if len(matches) > 0:
         return matches.iloc[0]['QUADRAN']
     
+    # Try partial match on kelurahan and kecamatan
+    mask_partial = (df_quadran['KELURAHAN'].astype(str).str.upper().str.contains(str(kelurahan).upper(), na=False)) & \
+                   (df_quadran['KECAMATAN'].astype(str).str.upper().str.contains(str(kecamatan).upper(), na=False))
+    
+    matches_partial = df_quadran[mask_partial]
+    
+    if len(matches_partial) > 0:
+        return matches_partial.iloc[0]['QUADRAN']
+    
     return "Tidak Diketahui"
 
-def calculate_distance(user_lat, user_lon, outlet_lat, outlet_lon):
-    """Calculate distance between two points in kilometers using euclidean"""
+def reverse_geocode(lat, lon):
+    """Reverse geocode coordinates to get address components"""
     try:
-        # Simple euclidean distance (approximate for small distances)
-        lat_diff = abs(user_lat - outlet_lat)
-        lon_diff = abs(user_lon - outlet_lon)
-        # Convert to km (1 degree ≈ 111 km)
-        distance = np.sqrt(lat_diff**2 + lon_diff**2) * 111
+        response = requests.get(
+            f"https://nominatim.openstreetmap.org/reverse?format=json&lat={lat}&lon={lon}",
+            headers={'User-Agent': 'StreamlitApp/1.0'},
+            timeout=5
+        )
+        if response.status_code == 200:
+            data = response.json()
+            address = data.get('address', {})
+            return {
+                'kelurahan': address.get('neighbourhood', address.get('suburb', '')),
+                'kecamatan': address.get('city_district', address.get('town', '')),
+                'kab_kot': address.get('city', address.get('county', '')),
+                'province': address.get('state', '')
+            }
+    except:
+        pass
+    return None
+
+def calculate_distance(user_lat, user_lon, outlet_lat, outlet_lon):
+    """Calculate distance between two points in kilometers"""
+    try:
+        coord1 = (user_lat, user_lon)
+        coord2 = (outlet_lat, outlet_lon)
+        distance = geodesic(coord1, coord2).kilometers
         return round(distance, 2)
     except:
         return None
 
-def find_nearest_outlets_by_segment(input_lat, input_lon, df_outlet, max_results_per_segment=1):
-    """Find nearest outlet for each segment (except INTERN) from input coordinates"""
-    if df_outlet is None or pd.isna(input_lat) or pd.isna(input_lon):
-        return pd.DataFrame()
+def create_map(outlet_lat, outlet_lon, user_lat=None, user_lon=None, outlet_name="", df_outlet_clean=None, show_all_outlets=False):
+    """Create interactive map with outlet and user location"""
+    m = folium.Map(location=[outlet_lat, outlet_lon], zoom_start=13)
     
-    # Filter outlets with valid coordinates and exclude INTERN segment
-    df_valid = df_outlet[
-        (pd.notna(df_outlet['Latitude'])) & 
-        (pd.notna(df_outlet['Longitude'])) &
-        (df_outlet['SEGMENTASI'] != 'INTERN')
-    ].copy()
+    # Add outlet marker
+    folium.Marker(
+        [outlet_lat, outlet_lon],
+        popup=f"<b>{outlet_name}</b>",
+        icon=folium.Icon(color='blue', icon='store', prefix='fa')
+    ).add_to(m)
     
-    if len(df_valid) == 0:
-        return pd.DataFrame()
+    # Add user location marker if provided
+    if user_lat and user_lon:
+        folium.Marker(
+            [user_lat, user_lon],
+            popup="<b>Lokasi Anda</b>",
+            icon=folium.Icon(color='red', icon='user', prefix='fa')
+        ).add_to(m)
+        
+        # Draw line between user and outlet
+        folium.PolyLine(
+            locations=[[user_lat, user_lon], [outlet_lat, outlet_lon]],
+            color='green',
+            weight=3,
+            opacity=0.7
+        ).add_to(m)
     
-    # Calculate distance for all outlets
-    df_valid['distance'] = np.sqrt(
-        (df_valid['Latitude'] - input_lat)**2 + 
-        (df_valid['Longitude'] - input_lon)**2
-    ) * 111  # Convert to km
-    
-    # Get unique segments
-    segments = df_valid['SEGMENTASI'].unique()
-    
-    results = []
-    for seg in segments:
-        seg_df = df_valid[df_valid['SEGMENTASI'] == seg]
-        if len(seg_df) > 0:
-            # Get nearest outlet for this segment
-            nearest = seg_df.nsmallest(max_results_per_segment, 'distance')
-            results.append(nearest)
-    
-    if results:
-        result_df = pd.concat(results, ignore_index=True)
-        return result_df.sort_values('distance')
-    
-    return pd.DataFrame()
-
-def determine_quadran_from_coords(input_lat, input_lon, df_quadran):
-    """Determine quadran from coordinates using reverse geocoding lookup"""
-    # This is a simplified version - in production you'd use a proper reverse geocoding API
-    # For now, we'll search for outlets near the coordinates and use their quadran
-    
-    if df_quadran is None or pd.isna(input_lat) or pd.isna(input_lon):
-        return "Tidak Diketahui", "", ""
-    
-    # We need to find which kelurahan/kecamatan this coordinate belongs to
-    # Since we don't have a proper reverse geocoding database, we'll use a simple approach:
-    # Find the nearest outlet and use its kelurahan/kecamatan for quadran lookup
-    
-    return "Reverse Geocoding Required", str(input_lat), str(input_lon)
-
-def create_map(outlets, center_lat=-2.5, center_lon=118.0, zoom=5):
-    """Create folium map with markers"""
-    m = folium.Map(location=[center_lat, center_lon], zoom_start=zoom)
-    
-    marker_cluster = MarkerCluster().add_to(m)
-    
-    count = 0
-    for _, row in outlets.iterrows():
-        if pd.notna(row.get('Latitude')) and pd.notna(row.get('Longitude')):
-            lat = row['Latitude']
-            lon = row['Longitude']
+    # Show all outlets as cluster if requested
+    if show_all_outlets and df_outlet_clean is not None:
+        outlets_with_coords = df_outlet_clean[
+            df_outlet_clean['Latitude'].notna() & 
+            df_outlet_clean['Longitude'].notna()
+        ]
+        
+        if len(outlets_with_coords) > 0:
+            marker_cluster = MarkerCluster().add_to(m)
             
-            popup_html = f"""
-            <div style="width: 200px;">
-                <b>{row.get('NAMA_PELANGGAN', 'N/A')}</b><br>
-                ID: {row.get('ID_PELANGGAN', 'N/A')}<br>
-                {row.get('ALAMAT', 'N/A')[:50]}...
-            </div>
-            """
-            
-            folium.Marker(
-                location=[lat, lon],
-                popup=folium.Popup(popup_html, max_width=250),
-                tooltip=row.get('NAMA_PELANGGAN', 'Outlet'),
-                icon=folium.Icon(color='blue', icon='store', prefix='fa')
-            ).add_to(marker_cluster)
-            count += 1
-            
-            # Limit markers for performance
-            if count >= 100:
-                break
+            for idx, row in outlets_with_coords.iterrows():
+                folium.Marker(
+                    [row['Latitude'], row['Longitude']],
+                    popup=f"{row.get('ID_PELANGGAN', '')} - {row.get('NAMA_PELANGGAN', '')}",
+                    icon=folium.Icon(color='lightblue', icon='store', prefix='fa')
+                ).add_to(marker_cluster)
     
     return m
 
-def main():
-    st.markdown('<h1 class="main-header">🏪 Outlet Detail Checker</h1>', unsafe_allow_html=True)
+def create_heatmap(df_outlet_clean):
+    """Create heatmap of outlet density"""
+    outlets_with_coords = df_outlet_clean[
+        df_outlet_clean['Latitude'].notna() & 
+        df_outlet_clean['Longitude'].notna()
+    ]
     
-    # Sidebar for navigation
-    st.sidebar.title("📋 Menu")
-    menu = st.sidebar.radio(
-        "Pilih Menu:",
-        ["🔍 Cari Outlet", "📊 Dashboard", "🗺️ Peta Sebaran", "💾 Export Data", "🌐 Spatial Analyzer"],
-        index=0
+    if len(outlets_with_coords) == 0:
+        return None
+    
+    heat_data = outlets_with_coords[['Latitude', 'Longitude']].values.tolist()
+    
+    m = folium.Map(
+        location=[outlets_with_coords['Latitude'].mean(), outlets_with_coords['Longitude'].mean()],
+        zoom_start=10
     )
     
-    # Load data lazily
-    df_outlet = None
-    df_rute = None
-    df_quadran = None
+    HeatMap(heat_data, radius=15, blur=20, max_zoom=1).add_to(m)
     
-    if menu == "🔍 Cari Outlet":
-        st.header("🔍 Pencarian Outlet")
-        st.info("Masukkan ID atau Nama Outlet untuk melihat detail lengkap")
-        
-        # Search inputs
-        col1, col2 = st.columns([3, 1])
-        with col1:
-            search_query = st.text_input(
-                "Cari Outlet (ID / Nama)",
-                placeholder="Ketik ID atau nama outlet...",
-                label_visibility="collapsed"
-            )
-        with col2:
-            search_type = st.selectbox(
-                "Tipe Pencarian",
-                ["contains", "exact", "fuzzy"],
-                format_func=lambda x: {"contains": "Contains (Partial)", "exact": "Exact Match", "fuzzy": "Fuzzy Match"}[x]
-            )
-        
-        if search_query:
-            with st.spinner('Mencari outlet...'):
-                df_outlet = get_outlet_data()
-                
-                if df_outlet is not None:
-                    results = search_outlet(search_query, df_outlet, search_type)
-                    
-                    if len(results) == 0:
-                        st.warning("❌ Outlet tidak ditemukan. Coba kata kunci lain atau tipe pencarian berbeda.")
-                    elif len(results) > 20:
-                        st.warning(f"⚠️ Ditemukan {len(results)} outlet. Tampilkan 20 pertama.")
-                        results = results.head(20)
-                    else:
-                        st.success(f"✅ Ditemukan {len(results)} outlet")
-                    
-                    # Display results
-                    for idx, (_, outlet) in enumerate(results.iterrows()):
-                        with st.expander(f"🏪 {outlet.get('NAMA_PELANGGAN', 'N/A')} - {outlet.get('ID_PELANGGAN', 'N/A')}", expanded=(idx==0)):
-                            col1, col2 = st.columns([2, 1])
-                            
-                            with col1:
-                                st.subheader("📋 Informasi Outlet")
-                                st.markdown(f"""
-                                - **ID Pelanggan:** `{outlet.get('ID_PELANGGAN', 'N/A')}`
-                                - **Nama:** {outlet.get('NAMA_PELANGGAN', 'N/A')}
-                                - **Alamat:** {outlet.get('ALAMAT', 'N/A')}
-                                - **Kelurahan:** {outlet.get('KELURAHAN', 'N/A')}
-                                - **Kecamatan:** {outlet.get('KECAMATAN', 'N/A')}
-                                - **Kab/Kota:** {outlet.get('KAB_KOT', 'N/A')}
-                                - **Provinsi:** {outlet.get('PROVINSI', 'N/A')}
-                                - **Depo:** {outlet.get('DEPO', 'N/A')}
-                                """)
-                                
-                                st.subheader("📞 Kontak")
-                                st.markdown(f"""
-                                - **Kontak Person:** {outlet.get('KONTAK', 'N/A')}
-                                - **Telepon:** {outlet.get('TELEPON', 'N/A')}
-                                """)
-                                
-                                st.subheader("💼 Bisnis")
-                                st.markdown(f"""
-                                - **Status:** {outlet.get('STATUS_PELANGGAN', 'N/A')}
-                                - **Segmentasi:** {outlet.get('SEGMENTASI', 'N/A')}
-                                """)
-                            
-                            with col2:
-                                # Map
-                                if pd.notna(outlet.get('Latitude')) and pd.notna(outlet.get('Longitude')):
-                                    st.subheader("📍 Lokasi")
-                                    single_outlet = pd.DataFrame([outlet])
-                                    m = create_map(
-                                        single_outlet,
-                                        center_lat=outlet['Latitude'],
-                                        center_lon=outlet['Longitude'],
-                                        zoom=15
-                                    )
-                                    st_folium(m, width=400, height=300)
-                                    
-                                    # Distance calculator
-                                    st.subheader("📏 Hitung Jarak")
-                                    user_lat = st.number_input(
-                                        "Latitude Anda",
-                                        value=-6.2088,
-                                        format="%.6f",
-                                        key=f"user_lat_{idx}"
-                                    )
-                                    user_lon = st.number_input(
-                                        "Longitude Anda",
-                                        value=106.8456,
-                                        format="%.6f",
-                                        key=f"user_lon_{idx}"
-                                    )
-                                    
-                                    if st.button("Hitung Jarak", key=f"calc_dist_{idx}"):
-                                        distance = calculate_distance(
-                                            user_lat, user_lon,
-                                            outlet['Latitude'], outlet['Longitude']
-                                        )
-                                        if distance:
-                                            st.metric("Jarak", f"{distance} km")
-                                else:
-                                    st.info("📍 Koordinat tidak tersedia")
-                            
-                            # Route info
-                            st.subheader("🚚 Informasi Rute")
-                            df_rute_temp = get_rute_data()
-                            if df_rute_temp is not None:
-                                routes = get_route_info(outlet.get('ID_PELANGGAN'), df_rute_temp)
-                                if len(routes) > 0:
-                                    st.dataframe(routes, use_container_width=True)
-                                else:
-                                    st.info("Tidak ada informasi rute untuk outlet ini")
-                            else:
-                                st.info("Data rute belum dimuat")
-                            
-                            # Quadran
-                            st.subheader("🎯 Kuadran")
-                            df_quadran_temp = get_quadran_data()
-                            quadran = determine_quadran(
-                                outlet.get('KELURAHAN'),
-                                outlet.get('KECAMATAN'),
-                                df_quadran_temp
-                            )
-                            st.metric("Kuadran", quadran)
-        
-        else:
-            st.info("👆 Masukkan kata kunci pencarian di atas")
+    return m
+
+def export_to_excel(df, filename_prefix="outlet_data"):
+    """Export dataframe to Excel for download"""
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        df.to_excel(writer, index=False, sheet_name='Data')
+    output.seek(0)
+    return output.getvalue()
+
+def main():
+    # Header
+    st.markdown('<h1 class="main-header">🏪 Outlet Detail Checker</h1>', unsafe_allow_html=True)
+    st.markdown("Cari detail outlet, rute, dan kuadran dengan mudah")
     
-    elif menu == "📊 Dashboard":
-        st.header("📊 Dashboard Analitik Outlet")
-        
-        df_outlet = get_outlet_data()
-        
-        if df_outlet is not None:
-            # Filter options
-            st.subheader("🔧 Filter Dashboard")
-            col1, col2 = st.columns(2)
-            
-            # Get unique depoes and statuses
-            depoes = sorted(df_outlet['DEPO'].dropna().unique()) if 'DEPO' in df_outlet.columns else []
-            statuses = sorted(df_outlet['STATUS_PELANGGAN'].dropna().unique()) if 'STATUS_PELANGGAN' in df_outlet.columns else []
-            
-            with col1:
-                filter_depo = st.multiselect("Filter by Depo", depoes, default=[])
-            with col2:
-                filter_status = st.multiselect("Filter by Status", statuses, default=[])
-            
-            # Apply filters
-            df_filtered = df_outlet.copy()
-            if filter_depo:
-                df_filtered = df_filtered[df_filtered['DEPO'].isin(filter_depo)]
-            if filter_status:
-                df_filtered = df_filtered[df_filtered['STATUS_PELANGGAN'].isin(filter_status)]
-            
-            st.info(f"Menampilkan {len(df_filtered):,} dari {len(df_outlet):,} outlet")
-            
-            # Metrics
-            total_outlets = len(df_filtered)
-            with_coords = df_filtered[pd.notna(df_filtered['Latitude']) & pd.notna(df_filtered['Longitude'])]
-            num_with_coords = len(with_coords)
-            
-            col1, col2, col3 = st.columns(3)
-            col1.metric("Total Outlet", f"{total_outlets:,}")
-            col2.metric("Dengan Koordinat", f"{num_with_coords:,}")
-            col3.metric("% Dengan Koordinat", f"{(num_with_coords/total_outlets*100):.1f}%" if total_outlets > 0 else "0%")
-            
-            # Charts
-            st.subheader("📈 Distribusi Status Pelanggan")
-            if 'STATUS_PELANGGAN' in df_filtered.columns:
-                status_counts = df_filtered['STATUS_PELANGGAN'].value_counts().head(10)
-                fig = px.pie(values=status_counts.values, names=status_counts.index, hole=0.4)
-                st.plotly_chart(fig, use_container_width=True)
-            
-            st.subheader("📊 Distribusi Segmentasi")
-            if 'SEGMENTASI' in df_filtered.columns:
-                seg_counts = df_filtered['SEGMENTASI'].value_counts().head(10)
-                fig = px.bar(x=seg_counts.index, y=seg_counts.values, labels={'x': 'Segmentasi', 'y': 'Jumlah'})
-                st.plotly_chart(fig, use_container_width=True)
-            
-            st.subheader("🏙️ Top 10 Kab/Kota")
-            if 'KAB_KOT' in df_filtered.columns:
-                city_counts = df_filtered['KAB_KOT'].value_counts().head(10)
-                fig = px.bar(x=city_counts.values, y=city_counts.index, orientation='h', labels={'x': 'Jumlah', 'y': 'Kab/Kota'})
-                st.plotly_chart(fig, use_container_width=True)
-            
-            st.subheader("🏢 Top 10 Kecamatan")
-            if 'KECAMATAN' in df_filtered.columns:
-                kecamatan_counts = df_filtered['KECAMATAN'].value_counts().head(10)
-                fig = px.bar(x=kecamatan_counts.values, y=kecamatan_counts.index, orientation='h', labels={'x': 'Jumlah', 'y': 'Kecamatan'})
-                st.plotly_chart(fig, use_container_width=True)
-            
-            st.subheader("🏘️ Top 10 Kelurahan")
-            if 'KELURAHAN' in df_filtered.columns:
-                kelurahan_counts = df_filtered['KELURAHAN'].value_counts().head(10)
-                fig = px.bar(x=kelurahan_counts.values, y=kelurahan_counts.index, orientation='h', labels={'x': 'Jumlah', 'y': 'Kelurahan'})
-                st.plotly_chart(fig, use_container_width=True)
-            
-            if 'DEPO' in df_filtered.columns:
-                st.subheader("🏭 Distribusi Depo")
-                depo_counts = df_filtered['DEPO'].value_counts().head(10)
-                fig = px.bar(x=depo_counts.index, y=depo_counts.values, labels={'x': 'Depo', 'y': 'Jumlah'})
-                st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.error("Gagal memuat data")
+    # Load data
+    df_outlet, df_rute, df_quadran, df_outlet_clean = load_data()
     
-    elif menu == "🗺️ Peta Sebaran":
-        st.header("🗺️ Peta Sebaran Outlet")
-        
-        df_outlet = get_outlet_data()
-        
-        if df_outlet is not None:
-            # Filter options
-            col1, col2 = st.columns(2)
-            depoes = sorted(df_outlet['DEPO'].dropna().unique()) if 'DEPO' in df_outlet.columns else []
-            statuses = sorted(df_outlet['STATUS_PELANGGAN'].dropna().unique()) if 'STATUS_PELANGGAN' in df_outlet.columns else []
-            
-            with col1:
-                map_filter_depo = st.multiselect("Filter by Depo", depoes, default=[], key="map_depo")
-            with col2:
-                map_filter_status = st.multiselect("Filter by Status", statuses, default=[], key="map_status")
-            
-            # Apply filters
-            df_filtered = df_outlet.copy()
-            if map_filter_depo:
-                df_filtered = df_filtered[df_filtered['DEPO'].isin(map_filter_depo)]
-            if map_filter_status:
-                df_filtered = df_filtered[df_filtered['STATUS_PELANGGAN'].isin(map_filter_status)]
-            
-            # Filter outlets with coordinates
-            outlets_with_coords = df_filtered[pd.notna(df_filtered['Latitude']) & pd.notna(df_filtered['Longitude'])]
-            
-            st.info(f"Menampilkan {min(len(outlets_with_coords), 100)} dari {len(outlets_with_coords)} outlet dengan koordinat")
-            
-            m = create_map(outlets_with_coords.head(100))
-            st_folium(m, width=1200, height=600)
+    if df_outlet is None:
+        st.error("Gagal memuat data. Pastikan file Excel tersedia.")
+        return
     
-    elif menu == "💾 Export Data":
-        st.header("💾 Export Data Outlet")
+    # Navigation menu
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("📱 Menu Utama")
+    
+    menu_options = [
+        "🔍 Cari Outlet",
+        "📊 Dashboard Analytics",
+        "🗺️ Peta Sebaran Outlet",
+        "💾 Export Data"
+    ]
+    
+    selected_menu = st.sidebar.selectbox("Pilih Menu:", menu_options)
+    
+    # Sidebar for search (only show in search mode)
+    if selected_menu == "🔍 Cari Outlet":
+        st.sidebar.markdown("---")
+        st.sidebar.header("🔍 Pencarian Outlet")
         
-        df_outlet = get_outlet_data()
+        search_query = st.sidebar.text_input(
+            "Masukkan ID Outlet atau Nama Outlet",
+            placeholder="Contoh: 343-0000001 atau REJEKI 2"
+        )
         
-        if df_outlet is not None:
-            # Filter options
-            st.subheader("🔧 Filter Export")
-            col1, col2 = st.columns(2)
+        search_type = st.sidebar.selectbox(
+            "Tipe Pencarian",
+            ["exact", "contains", "fuzzy"],
+            format_func=lambda x: {
+                "exact": "Exact Match (Persis)",
+                "contains": "Contains (Mengandung)",
+                "fuzzy": "Fuzzy Match (Mirip)"
+            }[x]
+        )
+        
+        search_button = st.sidebar.button("🔎 Cari Outlet", type="primary", use_container_width=True)
+        
+        st.sidebar.divider()
+        
+        # User location input
+        st.sidebar.header("📍 Lokasi Anda")
+        st.sidebar.info("Opsional: Masukkan koordinat untuk menghitung jarak")
+        
+        user_lat = st.sidebar.number_input(
+            "Latitude Anda",
+            min_value=-90.0,
+            max_value=90.0,
+            value=None,
+            format="%.6f",
+            key="user_lat"
+        )
+        
+        user_lon = st.sidebar.number_input(
+            "Longitude Anda",
+            min_value=-180.0,
+            max_value=180.0,
+            value=None,
+            format="%.6f",
+            key="user_lon"
+        )
+        
+        # Geolocate button
+        if st.sidebar.button("🌐 Gunakan Lokasi Saya", use_container_width=True):
+            st.sidebar.write("Untuk menggunakan lokasi otomatis, silakan masukkan koordinat manual atau gunakan browser yang mendukung geolocation.")
+        
+        # Main content area for search results
+        if search_query and search_button:
+            results = search_outlet(search_query, df_outlet, search_type)
             
-            depoes = sorted(df_outlet['DEPO'].dropna().unique()) if 'DEPO' in df_outlet.columns else []
-            statuses = sorted(df_outlet['STATUS_PELANGGAN'].dropna().unique()) if 'STATUS_PELANGGAN' in df_outlet.columns else []
-            
-            with col1:
-                export_filter_depo = st.multiselect("Filter by Depo", depoes, default=[], key="export_depo")
-            with col2:
-                export_filter_status = st.multiselect("Filter by Status", statuses, default=[], key="export_status")
-            
-            # Apply filters
-            df_filtered = df_outlet.copy()
-            if export_filter_depo:
-                df_filtered = df_filtered[df_filtered['DEPO'].isin(export_filter_depo)]
-            if export_filter_status:
-                df_filtered = df_filtered[df_filtered['STATUS_PELANGGAN'].isin(export_filter_status)]
-            
-            st.write(f"Total records setelah filter: {len(df_filtered):,}")
-            
-            export_option = st.selectbox(
-                "Pilih data yang akan diexport:",
-                ["Semua Outlet (Setelah Filter)", "Outlet dengan Koordinat", "Outlet Aktif"]
-            )
-            
-            if export_option == "Semua Outlet (Setelah Filter)":
-                df_export = df_filtered
-            elif export_option == "Outlet dengan Koordinat":
-                df_export = df_filtered[pd.notna(df_filtered['Latitude']) & pd.notna(df_filtered['Longitude'])]
+            if len(results) == 0:
+                st.warning("❌ Outlet tidak ditemukan. Coba tipe pencarian lain atau periksa kembali input Anda.")
             else:
-                df_export = df_filtered[df_filtered['STATUS_PELANGGAN'].astype(str).str.contains('AKTIF', na=False)]
-            
-            st.write(f"Preview ({len(df_export)} records):")
-            st.dataframe(df_export.head(), use_container_width=True)
-            
-            # Create Excel file
-            buffer = io.BytesIO()
-            with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-                df_export.to_excel(writer, index=False, sheet_name='Outlet Data')
-            
-            st.download_button(
-                label="📥 Download Excel",
-                data=buffer.getvalue(),
-                file_name=f"outlet_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                mime="application/vnd.ms-excel"
-            )
-    
-    elif menu == "🌐 Spatial Analyzer":
-        st.header("🌐 Spatial Analyzer - Cari Outlet Terdekat per Segmen")
-        st.info("Masukkan koordinat latitude dan longitude untuk mencari outlet terdekat dari setiap segmen (kecuali INTERN)")
-        
-        df_outlet = get_outlet_data()
-        df_quadran = get_quadran_data()
-        
-        if df_outlet is not None:
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                input_lat = st.number_input(
-                    "Latitude",
-                    value=-6.2088,
-                    format="%.6f",
-                    help="Masukkan latitude koordinat target"
-                )
-            
-            with col2:
-                input_lon = st.number_input(
-                    "Longitude",
-                    value=106.8456,
-                    format="%.6f",
-                    help="Masukkan longitude koordinat target"
-                )
-            
-            if st.button("🔍 Analisis Spatial", type="primary"):
-                with st.spinner('Menganalisis spatial...'):
-                    # Find nearest outlets by segment
-                    nearest_outlets = find_nearest_outlets_by_segment(input_lat, input_lon, df_outlet)
+                st.success(f"✅ Ditemukan {len(results)} outlet")
+                
+                # If multiple results, show selection
+                if len(results) > 1:
+                    st.subheader("Pilih Outlet:")
+                    outlet_options = results.apply(
+                        lambda x: f"{x['ID_PELANGGAN']} - {x['NAMA_PELANGGAN']}", axis=1
+                    ).tolist()
                     
-                    if len(nearest_outlets) > 0:
-                        st.success(f"✅ Ditemukan {len(nearest_outlets)} segmen dengan outlet terdekat")
+                    selected = st.selectbox("Pilih outlet yang diinginkan:", outlet_options)
+                    selected_idx = outlet_options.index(selected)
+                    outlet = results.iloc[selected_idx]
+                else:
+                    outlet = results.iloc[0]
+                
+                st.divider()
+                
+                # Display outlet details
+                col1, col2 = st.columns([2, 1])
+                
+                with col1:
+                    st.markdown('<h3 class="sub-header">📋 Detail Outlet</h3>', unsafe_allow_html=True)
+                    
+                    # Basic info cards
+                    c1, c2, c3 = st.columns(3)
+                    with c1:
+                        st.metric("ID Pelanggan", outlet['ID_PELANGGAN'])
+                    with c2:
+                        st.metric("Status", outlet['STATUS_PELANGGAN'])
+                    with c3:
+                        st.metric("Segmen", outlet['SEGMEN'])
+                    
+                    st.markdown('<div class="info-box">', unsafe_allow_html=True)
+                    st.write(f"**Nama Outlet:** {outlet['NAMA_PELANGGAN']}")
+                    st.write(f"**Alamat:** {outlet['ALAMAT']}")
+                    st.write(f"**Kelurahan:** {outlet['KELURAHAN']}")
+                    st.write(f"**Kecamatan:** {outlet['KECAMATAN']}")
+                    st.write(f"**Kota/Kabupaten:** {outlet['KOTA']}")
+                    st.write(f"**Provinsi:** {outlet['PROVINSI']}")
+                    st.write(f"**Kode Pos:** {outlet['KODE_POS']}")
+                    st.markdown('</div>', unsafe_allow_html=True)
+                    
+                    # Contact info
+                    st.markdown('<h4 class="sub-header">📞 Kontak</h4>', unsafe_allow_html=True)
+                    contact_cols = st.columns(3)
+                    with contact_cols[0]:
+                        if pd.notna(outlet['TELP_1']):
+                            st.info(f"Telp 1: {outlet['TELP_1']}")
+                    with contact_cols[1]:
+                        if pd.notna(outlet['TELP_2']):
+                            st.info(f"Telp 2: {outlet['TELP_2']}")
+                    with contact_cols[2]:
+                        if pd.notna(outlet['TELP_3']):
+                            st.info(f"Telp 3: {outlet['TELP_3']}")
+                    
+                    if pd.notna(outlet['KONTAK_PERSON']):
+                        st.write(f"**Kontak Person:** {outlet['KONTAK_PERSON']}")
+                    
+                    # Additional info
+                    st.markdown('<h4 class="sub-header">💼 Informasi Bisnis</h4>', unsafe_allow_html=True)
+                    biz_cols = st.columns(4)
+                    with biz_cols[0]:
+                        st.write(f"**Tempo:** {outlet['TEMPO_PEMBAYARAN']}")
+                    with biz_cols[1]:
+                        st.write(f"**Tipe:** {outlet['TIPE_PELANGGAN']}")
+                    with biz_cols[2]:
+                        st.write(f"**Limit:** Rp {outlet['KREDIT_LIMIT']:,.0f}")
+                    with biz_cols[3]:
+                        st.write(f"**Depo:** {outlet['DEPO_JUAL']}")
+                    
+                    # Dates
+                    date_cols = st.columns(2)
+                    with date_cols[0]:
+                        st.write(f"**Tanggal Join:** {outlet['TANGGAL_JOIN']}")
+                    with date_cols[1]:
+                        if pd.notna(outlet['TANGGAL_STOP']) and str(outlet['TANGGAL_STOP']) != '00:00:00':
+                            st.write(f"**Tanggal Stop:** {outlet['TANGGAL_STOP']}")
+                
+                with col2:
+                    st.markdown('<h3 class="sub-header">🗺️ Peta Lokasi</h3>', unsafe_allow_html=True)
+                    
+                    lat, lon = clean_coordinates(outlet['Latitude'], outlet['Longitude'])
+                    
+                    if lat and lon:
+                        # Create map
+                        user_lat_clean = user_lat if user_lat else None
+                        user_lon_clean = user_lon if user_lon else None
                         
-                        # Display results
-                        st.subheader("📍 Outlet Terdekat per Segmen")
+                        m = create_map(lat, lon, user_lat_clean, user_lon_clean, outlet['NAMA_PELANGGAN'])
+                        st_folium(m, width=400, height=400)
                         
-                        for idx, (_, outlet) in enumerate(nearest_outlets.iterrows()):
-                            with st.expander(f"🏪 {outlet['SEGMENTASI']} - {outlet.get('NAMA_PELANGGAN', 'N/A')} ({outlet['distance']:.2f} km)", expanded=True):
-                                col_a, col_b = st.columns([2, 1])
-                                
-                                with col_a:
-                                    st.markdown(f"""
-                                    - **ID Pelanggan:** `{outlet.get('ID_PELANGGAN', 'N/A')}`
-                                    - **Nama:** {outlet.get('NAMA_PELANGGAN', 'N/A')}
-                                    - **Segmen:** {outlet.get('SEGMENTASI', 'N/A')}
-                                    - **Alamat:** {outlet.get('ALAMAT', 'N/A')}
-                                    - **Kab/Kota:** {outlet.get('KAB_KOT', 'N/A')}
-                                    - **Provinsi:** {outlet.get('PROVINSI', 'N/A')}
-                                    - **Jarak:** **{outlet['distance']:.2f} km**
-                                    """)
-                                
-                                with col_b:
-                                    if pd.notna(outlet.get('Latitude')) and pd.notna(outlet.get('Longitude')):
-                                        single_outlet = pd.DataFrame([outlet])
-                                        m = create_map(
-                                            single_outlet,
-                                            center_lat=outlet['Latitude'],
-                                            center_lon=outlet['Longitude'],
-                                            zoom=14
-                                        )
-                                        
-                                        # Add marker for input coordinate
-                                        folium.Marker(
-                                            location=[input_lat, input_lon],
-                                            popup="Koordinat Input",
-                                            icon=folium.Icon(color='red', icon='star', prefix='fa')
-                                        ).add_to(m)
-                                        
-                                        st_folium(m, width=350, height=250)
+                        # Calculate distance
+                        if user_lat_clean and user_lon_clean:
+                            distance = calculate_distance(user_lat_clean, user_lon_clean, lat, lon)
+                            if distance:
+                                st.markdown(f'<div class="metric-card"><h3>📏 Jarak: {distance} km</h3></div>', unsafe_allow_html=True)
                         
-                        # Show summary table
-                        st.subheader("📊 Ringkasan Outlet Terdekat")
-                        summary_df = nearest_outlets[['SEGMENTASI', 'ID_PELANGGAN', 'NAMA_PELANGGAN', 'distance']].copy()
-                        summary_df.columns = ['Segmen', 'ID Outlet', 'Nama Outlet', 'Jarak (km)']
-                        summary_df['Jarak (km)'] = summary_df['Jarak (km)'].round(2)
-                        st.dataframe(summary_df, use_container_width=True)
-                        
-                        # Show on map all nearest outlets
-                        st.subheader("🗺️ Peta Semua Outlet Terdekat")
-                        m_all = create_map(nearest_outlets, center_lat=input_lat, center_lon=input_lon, zoom=12)
-                        
-                        # Add marker for input coordinate
-                        folium.Marker(
-                            location=[input_lat, input_lon],
-                            popup="Koordinat Input Anda",
-                            icon=folium.Icon(color='red', icon='star', prefix='fa')
-                        ).add_to(m_all)
-                        
-                        st_folium(m_all, width=1200, height=600)
-                        
+                        # Coordinates display
+                        st.code(f"Latitude: {lat}\nLongitude: {lon}")
                     else:
-                        st.warning("❌ Tidak ditemukan outlet dengan koordinat valid")
+                        st.warning("⚠️ Koordinat tidak tersedia untuk outlet ini")
+                
+                st.divider()
+                
+                # Route Information
+                st.markdown('<h3 class="sub-header">🚚 Informasi Rute</h3>', unsafe_allow_html=True)
+                route_info = get_route_info(outlet['ID_PELANGGAN'], df_rute)
+                
+                if len(route_info) > 0:
+                    route = route_info.iloc[0]
+                    
+                    route_col1, route_col2 = st.columns(2)
+                    
+                    with route_col1:
+                        st.markdown('<div class="info-box">', unsafe_allow_html=True)
+                        st.write(f"**ID Rute:** {route['ID RUTE']}")
+                        st.write(f"**Nama Rute:** {route['NAMA RUTE']}")
+                        st.write(f"**Tipe Rute:** {route['TIPE RUTE']}")
+                        st.write(f"**Sales:** {route['NAMA SALES']} ({route['ID SALES']})")
+                        st.write(f"**Supervisor:** {route['NAMA SUPERVISOR']}")
+                        st.write(f"**Depo:** {route['NAMA DEPO']}")
+                        st.markdown('</div>', unsafe_allow_html=True)
+                    
+                    with route_col2:
+                        # Visit schedule
+                        st.write("**Jadwal Kunjungan:**")
+                        days = ['SENIN', 'SELASA', 'RABU', 'KAMIS', 'JUMAT', 'SABTU', 'MINGGU']
+                        visit_days = []
+                        for day in days:
+                            if pd.notna(route.get(day)) and route.get(day) == 'V':
+                                visit_days.append(day)
+                        
+                        if visit_days:
+                            for day in visit_days:
+                                st.success(f"✓ {day}")
+                        else:
+                            # Check MINGGU_1 to MINGGU_4
+                            minggu_cols = st.columns(4)
+                            for i, col in enumerate(minggu_cols, 1):
+                                week_col = f'MINGGU_{i}'
+                                if pd.notna(route.get(week_col)) and route.get(week_col) == 'V':
+                                    with col:
+                                        st.success(f"Minggu {i}")
+                    
+                    # Additional route info
+                    st.markdown('<div class="info-box">', unsafe_allow_html=True)
+                    st.write(f"**Divisi:** {route['DIVISI']}")
+                    st.write(f"**Department:** {route['DEPARTMENT']}")
+                    st.write(f"**Tanggal Jadi Pelanggan:** {route['TANGGAL JADI PELANGGAN']}")
+                    st.markdown('</div>', unsafe_allow_html=True)
+                else:
+                    st.info("ℹ️ Tidak ada informasi rute untuk outlet ini")
+                
+                st.divider()
+                
+                # Quadran Determination
+                st.markdown('<h3 class="sub-header">📍 Penentuan Kuadran</h3>', unsafe_allow_html=True)
+                
+                quadran_col1, quadran_col2 = st.columns(2)
+                
+                with quadran_col1:
+                    # Get location data
+                    kelurahan = outlet['KELURAHAN']
+                    kecamatan = outlet['KECAMATAN']
+                    kab_kot = outlet['KOTA']
+                    province = outlet['PROVINSI']
+                    
+                    # Try reverse geocoding if coordinates available
+                    if lat and lon:
+                        if st.button("🔄 Update dari Koordinat (Reverse Geocode)", key="reverse_geo"):
+                            with st.spinner("Sedang melakukan reverse geocoding..."):
+                                geo_result = reverse_geocode(lat, lon)
+                                if geo_result:
+                                    st.success("Reverse geocoding berhasil!")
+                                    if geo_result['kelurahan']:
+                                        kelurahan = geo_result['kelurahan']
+                                    if geo_result['kecamatan']:
+                                        kecamatan = geo_result['kecamatan']
+                                    if geo_result['kab_kot']:
+                                        kab_kot = geo_result['kab_kot']
+                                    if geo_result['province']:
+                                        province = geo_result['province']
+                                else:
+                                    st.warning("Gagal melakukan reverse geocoding")
+                    
+                    st.write("**Data Lokasi untuk Lookup:**")
+                    st.write(f"- Provinsi: {province}")
+                    st.write(f"- Kota/Kab: {kab_kot}")
+                    st.write(f"- Kecamatan: {kecamatan}")
+                    st.write(f"- Kelurahan: {kelurahan}")
+                
+                with quadran_col2:
+                    # Determine quadran
+                    quadran = determine_quadran(lat, lon, kelurahan, kecamatan, kab_kot, province, df_quadran)
+                    
+                    if quadran != "Tidak Diketahui":
+                        st.markdown(f'<div class="metric-card" style="background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);"><h2>🎯 Kuadran: {quadran}</h2></div>', unsafe_allow_html=True)
+                    else:
+                        st.markdown(f'<div class="metric-card" style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);"><h2>❓ Kuadran: Tidak Diketahui</h2></div>', unsafe_allow_html=True)
+                        st.info("Kuadran tidak dapat ditentukan. Pastikan data kelurahan/kecamatan sesuai dengan database quadran.")
+                
+                # Show quadran lookup table sample
+                with st.expander("📊 Lihat Aturan Pembagian Kuadran"):
+                    st.write("Berikut adalah contoh aturan pembagian kuadran:")
+                    st.dataframe(df_quadran.head(20), use_container_width=True)
+                    st.write(f"Total aturan: {len(df_quadran)} baris")
         else:
-            st.error("Gagal memuat data outlet")
+            # Welcome message when no search performed
+            st.markdown("""
+            <div style="text-align: center; padding: 3rem;">
+                <h2>Selamat Datang di Fitur Pencarian Outlet</h2>
+                <p>Masukkan ID atau nama outlet di sidebar untuk memulai pencarian</p>
+            </div>
+            """, unsafe_allow_html=True)
+    
+    # Dashboard Analytics Menu
+    elif selected_menu == "📊 Dashboard Analytics":
+        st.header("📊 Dashboard Analytics")
+        st.markdown("Analisis data outlet secara keseluruhan")
+        
+        # Overview statistics
+        st.subheader("📈 Statistik Umum")
+        stat_col1, stat_col2, stat_col3, stat_col4 = st.columns(4)
+        with stat_col1:
+            st.metric("Total Outlet", f"{len(df_outlet):,}")
+        with stat_col2:
+            outlets_with_coords = df_outlet[df_outlet['Latitude'].notna() & df_outlet['Longitude'].notna()]
+            st.metric("Outlet dengan Koordinat", f"{len(outlets_with_coords):,}")
+        with stat_col3:
+            st.metric("Total Rute", f"{len(df_rute):,}")
+        with stat_col4:
+            st.metric("Aturan Kuadran", f"{len(df_quadran):,}")
+        
+        st.divider()
+        
+        # Distribution by status
+        col1, col2 = st.columns(2)
+        with col1:
+            st.subheader("Distribusi Status Pelanggan")
+            if 'STATUS_PELANGGAN' in df_outlet.columns:
+                status_counts = df_outlet['STATUS_PELANGGAN'].value_counts().reset_index()
+                status_counts.columns = ['Status', 'Jumlah']
+                fig_status = px.pie(status_counts, values='Jumlah', names='Status', 
+                                   title='Proporsi Status Pelanggan',
+                                   color_discrete_sequence=px.colors.qualitative.Set3)
+                st.plotly_chart(fig_status, use_container_width=True)
+        
+        with col2:
+            st.subheader("Distribusi Segmen")
+            if 'SEGMEN' in df_outlet.columns:
+                segmen_counts = df_outlet['SEGMEN'].value_counts().reset_index()
+                segmen_counts.columns = ['Segmen', 'Jumlah']
+                fig_segmen = px.bar(segmen_counts, x='Segmen', y='Jumlah',
+                                   title='Jumlah Outlet per Segmen',
+                                   color='Jumlah',
+                                   color_continuous_scale='Blues')
+                st.plotly_chart(fig_segmen, use_container_width=True)
+        
+        st.divider()
+        
+        # Geographic distribution
+        st.subheader("🗺️ Distribusi Geografis")
+        if 'PROVINSI' in df_outlet.columns:
+            prov_counts = df_outlet['PROVINSI'].value_counts().head(10).reset_index()
+            prov_counts.columns = ['Provinsi', 'Jumlah']
+            fig_prov = px.bar(prov_counts, x='Jumlah', y='Provinsi', orientation='h',
+                             title='Top 10 Provinsi dengan Terbanyak Outlet',
+                             color='Jumlah',
+                             color_continuous_scale='Viridis')
+            st.plotly_chart(fig_prov, use_container_width=True)
+        
+        # Credit limit analysis
+        if 'KREDIT_LIMIT' in df_outlet_clean.columns:
+            st.divider()
+            st.subheader("💰 Analisis Kredit Limit")
+            
+            credit_stats = df_outlet_clean['KREDIT_LIMIT'].describe()
+            c1, c2, c3, c4 = st.columns(4)
+            with c1:
+                st.metric("Rata-rata", f"Rp {credit_stats['mean']:,.0f}")
+            with c2:
+                st.metric("Median", f"Rp {credit_stats['50%']:,.0f}")
+            with c3:
+                st.metric("Max", f"Rp {credit_stats['max']:,.0f}")
+            with c4:
+                st.metric("Min", f"Rp {credit_stats['min']:,.0f}")
+            
+            fig_credit = px.histogram(df_outlet_clean, x='KREDIT_LIMIT', nbins=50,
+                                     title='Distribusi Kredit Limit',
+                                     labels={'KREDIT_LIMIT': 'Kredit Limit (Rp)'},
+                                     opacity=0.7)
+            st.plotly_chart(fig_credit, use_container_width=True)
+    
+    # Map Menu
+    elif selected_menu == "🗺️ Peta Sebaran Outlet":
+        st.header("🗺️ Peta Sebaran Outlet")
+        st.markdown("Visualisasi sebaran outlet di peta")
+        
+        map_type = st.selectbox("Pilih Tipe Peta:", ["Marker Cluster", "Heatmap"])
+        
+        if map_type == "Marker Cluster":
+            st.info(f"Menampilkan {len(df_outlet_clean[df_outlet_clean['Latitude'].notna()])} outlet dengan koordinat valid")
+            
+            # Create map centered on Indonesia
+            m = folium.Map(location=[-2.5, 118], zoom_start=5)
+            
+            outlets_with_coords = df_outlet_clean[
+                df_outlet_clean['Latitude'].notna() & 
+                df_outlet_clean['Longitude'].notna()
+            ]
+            
+            if len(outlets_with_coords) > 0:
+                marker_cluster = MarkerCluster().add_to(m)
+                
+                for idx, row in outlets_with_coords.iterrows():
+                    popup_html = f"""
+                    <b>{row.get('NAMA_PELANGGAN', 'N/A')}</b><br>
+                    ID: {row.get('ID_PELANGGAN', 'N/A')}<br>
+                    Alamat: {row.get('ALAMAT', 'N/A')}
+                    """
+                    folium.Marker(
+                        [row['Latitude'], row['Longitude']],
+                        popup=popup_html,
+                        icon=folium.Icon(color='blue', icon='store', prefix='fa')
+                    ).add_to(marker_cluster)
+                
+                st_folium(m, width=1200, height=600)
+        
+        elif map_type == "Heatmap":
+            st.info("Heatmap menunjukkan kepadatan outlet")
+            
+            heat_map = create_heatmap(df_outlet_clean)
+            if heat_map:
+                st_folium(heat_map, width=1200, height=600)
+            else:
+                st.warning("Tidak ada data koordinat yang valid untuk membuat heatmap")
+    
+    # Export Menu
+    elif selected_menu == "💾 Export Data":
+        st.header("💾 Export Data")
+        st.markdown("Download data outlet dalam format Excel")
+        
+        export_option = st.selectbox(
+            "Pilih data yang ingin diexport:",
+            ["Semua Outlet", "Outlet dengan Koordinat", "Outlet Aktif", "Data Rute", "Aturan Kuadran"]
+        )
+        
+        if export_option == "Semua Outlet":
+            df_to_export = df_outlet
+            filename = "MASTER_OUTLET_AQUA.xlsx"
+        elif export_option == "Outlet dengan Koordinat":
+            df_to_export = df_outlet_clean[
+                df_outlet_clean['Latitude'].notna() & 
+                df_outlet_clean['Longitude'].notna()
+            ]
+            filename = "OUTLET_DENGAN_KOORDINAT.xlsx"
+        elif export_option == "Outlet Aktif":
+            if 'STATUS_PELANGGAN' in df_outlet.columns:
+                df_to_export = df_outlet[df_outlet['STATUS_PELANGGAN'] == 'AKTIF']
+                filename = "OUTLET_AKTIF.xlsx"
+            else:
+                df_to_export = df_outlet
+                filename = "MASTER_OUTLET_AQUA.xlsx"
+        elif export_option == "Data Rute":
+            df_to_export = df_rute
+            filename = "DATA_RUTE.xlsx"
+        else:  # Aturan Kuadran
+            df_to_export = df_quadran
+            filename = "ATURAN_KUADRAN.xlsx"
+        
+        st.write(f"**Preview Data:**")
+        st.dataframe(df_to_export.head(10), use_container_width=True)
+        st.write(f"Total baris: {len(df_to_export):,}")
+        
+        # Create download button
+        excel_data = export_to_excel(df_to_export)
+        
+        st.download_button(
+            label=f"📥 Download {filename}",
+            data=excel_data,
+            file_name=filename,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True
+        )
 
 if __name__ == "__main__":
     main()
